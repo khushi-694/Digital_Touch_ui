@@ -20,6 +20,10 @@ status_data = {
     "sensor_data": [] # This will now store entries from the combined data
 }
 
+# Define constants for parsing (should match Arduino's TX_NUM and RX_NUM)
+TX_NUM = 7
+RX_NUM = 7
+
 @app.route('/')
 def serve_react():
     return send_from_directory(app.static_folder, 'index.html')
@@ -31,52 +35,64 @@ def serve_static(filename):
     except FileNotFoundError:
         return jsonify({"error": "File not found"}), 404
 
-@app.route('/api/post', methods=['POST'])
+# Modified endpoint to accept plain text CSV data
+@app.route('/sensor', methods=['POST']) # Changed endpoint from /api/post to /sensor as in the proposed Arduino code
 def receive_sensor_data():
-    data = request.get_json()
+    # Expecting plain text CSV data, not JSON
+    data_string = request.data.decode('utf-8')
+    # print(f"Received raw data string: {data_string}") # For debugging
 
-    # --- MODIFICATION STARTS HERE ---
-    # Expected combined JSON format from Arduino:
-    # {"time": T, "samples": [{"tx":N, "rx":[...]}, {"tx":M, "rx":[...]}, ...]}
+    if not data_string:
+        print("ERROR: No data string received.")
+        return jsonify({"error": "No data received"}), 400
 
-    if not data or 'time' not in data or 'samples' not in data:
-        # Log for debugging purposes, will appear in your Flask console
-        print(f"ERROR: Invalid top-level data format. Received: {data}")
-        return jsonify({"error": "Invalid data, missing 'time' or 'samples' array"}), 400
+    try:
+        # Split the string by comma and convert to integers
+        # Expected format: "overall_time,tx0_idx,rx0_0,...,rx0_6,tx1_idx,rx1_0,...,rx1_6,..."
+        values = [int(v.strip()) for v in data_string.split(',')]
 
-    overall_timestamp = data["time"]
-    samples_data = data["samples"]
+        # Calculate expected number of values: 1 (overall_time) + TX_NUM * (1 (tx_idx) + RX_NUM (rx_values))
+        expected_len = 1 + TX_NUM * (1 + RX_NUM)
 
-    if not isinstance(samples_data, list):
-        print(f"ERROR: 'samples' is not a list. Received: {samples_data}")
-        return jsonify({"error": "Invalid 'samples' format, expected a list"}), 400
+        if len(values) != expected_len:
+            print(f"ERROR: Received incorrect number of values. Expected {expected_len}, got {len(values)}. Data: {data_string}")
+            return jsonify({"error": f"Invalid data format. Expected {expected_len} values, got {len(values)}"}), 400
 
-    # Iterate through each individual sample within the 'samples' array
-    for sample_entry in samples_data:
-        # Validate each individual sample dictionary
-        if not isinstance(sample_entry, dict) or 'tx' not in sample_entry or 'rx' not in sample_entry:
-            print(f"ERROR: Invalid sample entry within 'samples' array. Received: {sample_entry}")
-            return jsonify({"error": "Invalid sample entry within 'samples' array, missing 'tx' or 'rx'"}), 400
+        overall_timestamp = values[0]
+        current_index = 1 # Start processing from the first TX block
 
-        tx_value = sample_entry["tx"]
-        rx_list = sample_entry["rx"]
+        # Iterate through each TX block within the received data string
+        for i in range(TX_NUM):
+            tx_value = values[current_index]
+            rx_list_start = current_index + 1
+            rx_list_end = rx_list_start + RX_NUM
+            rx_values = values[rx_list_start:rx_list_end]
 
-        # Ensure 'rx' is a list of numbers for each sub-entry
-        if not isinstance(rx_list, list) or not all(isinstance(val, (int, float)) for val in rx_list):
-            print(f"ERROR: Invalid 'rx' format for TX {tx_value}. Expected list of numbers. Received: {rx_list}")
-            return jsonify({"error": f"Invalid 'rx' format for TX {tx_value}, expected list of numbers"}), 400
+            # Validate RX values (ensure they are numbers)
+            if not all(isinstance(val, (int, float)) for val in rx_values):
+                print(f"ERROR: Invalid 'rx' format for TX {tx_value}. Expected list of numbers. Received: {rx_values}")
+                return jsonify({"error": f"Invalid 'rx' format for TX {tx_value}, expected list of numbers"}), 400
 
-        # Store the individual TX/RX readings.
-        # Use the `overall_timestamp` from the outer JSON to group these
-        # individual TX-RX readings as part of the same scan.
-        status_data["sensor_data"].append({
-            "time": overall_timestamp, # Use the timestamp from the outer combined JSON
-            "tx": tx_value,
-            "rx": rx_list
-        })
-    # --- MODIFICATION ENDS HERE ---
+            # Store the individual TX/RX readings.
+            # Use the `overall_timestamp` from the outer CSV to group these
+            # individual TX-RX readings as part of the same scan.
+            status_data["sensor_data"].append({
+                "time": overall_timestamp, # Use the timestamp from the outer combined CSV
+                "tx": tx_value,
+                "rx": rx_values
+            })
 
-    return jsonify({"message": "Combined data received and processed"}), 200
+            current_index = rx_list_end # Move to the start of the next TX block
+
+    except ValueError as e:
+        print(f"ERROR: Data parsing failed (ValueError): {e}. Received data: {data_string}")
+        return jsonify({"error": f"Data parsing error: {e}"}), 400
+    except Exception as e:
+        print(f"ERROR: An unexpected error occurred during data processing: {e}. Received data: {data_string}")
+        return jsonify({"error": f"Server error: {e}"}), 500
+
+    return jsonify({"message": "Combined CSV data received and processed"}), 200
+
 
 @app.route('/api/start', methods=['POST'])
 def start_test():
@@ -190,12 +206,6 @@ def plot_img():
     all_rx_readings_for_df = []
     for entry in status_data["sensor_data"]:
         # Each 'entry' here is like: {"time": T, "tx": N, "rx": [R0, R1, ...]}
-        # We want to plot RX values against time.
-        # To distinguish between RX values from different TXs at the same 'time' (from combined packet),
-        # we'll create columns like TX0_RX0, TX0_RX1, etc.
-        # Or, simpler, just plot RX0, RX1, etc., and let the 'tx' column differentiate.
-
-        # To match the CSV structure (time, tx, rx0, rx1...rx6), we'll do the same for plotting:
         row_dict = {"time": entry["time"], "tx": entry["tx"]} # Include TX in the row
         for i, rx_val in enumerate(entry["rx"]):
             row_dict[f"rx{i}"] = rx_val # Use rx0, rx1... column names
@@ -213,23 +223,13 @@ def plot_img():
         x_axis_data = df_plot.index
         x_axis_label = "Sample Index" # Fallback
 
-    # Plot each RX column, but now we have multiple TXs.
-    # We should plot each TX-RX combination uniquely.
-    # This loop assumes a flat structure where each row is a (time, tx, [rx]) snapshot.
-    # If you want to see all RX for a given TX (e.g., RX0 across all TXs), this logic is fine.
-    # If you want to differentiate RX0 from TX0, TX1, etc., then you'd need more specific columns.
-
-    # Given your CSV has `tx` as a column and then `rx0` to `rx6`,
-    # the plot will show lines for rx0, rx1, etc., across all `tx` values.
-    # This can make the plot busy. A better plot might be to group by `tx` first.
-
-    # Let's plot each RX value, and color/style by TX, or simply plot separate charts.
-    # For now, sticking to your current plotting approach, which plots all rx columns:
-    for i in range(7): 
-        col_name = f"rx{i}" # This plots a line for 'rx0', 'rx1' etc.
+    # Plot each RX column
+    # For a clearer plot, you might want to create separate subplots for each TX line,
+    # or loop through TX values and plot RX values for that TX.
+    # For now, it will plot all rx0, rx1, ... lines across the entire dataset.
+    for i in range(RX_NUM): # Use RX_NUM constant
+        col_name = f"rx{i}"
         if col_name in df_plot.columns:
-            # You might want to filter by TX if the plot gets too messy
-            # e.g., plt.plot(df_plot[df_plot['tx'] == 0]['time'], df_plot[df_plot['tx'] == 0][col_name], label=f"TX0_{col_name}")
             plt.plot(x_axis_data, df_plot[col_name], label=col_name, marker='.', markersize=4, linestyle='-')
 
     plt.xlabel(x_axis_label)
@@ -252,8 +252,6 @@ def download_csv():
     
     # This structure correctly flattens the RX list into multiple columns (rx0, rx1, ...)
     # Each dictionary in the list becomes a row in the DataFrame
-    # This part correctly processes the data stored in sensor_data (which now holds
-    # entries from the combined Arduino payload)
     df = pd.DataFrame([
         {"time": d["time"], "tx": d["tx"], **{f"rx{i}": val for i, val in enumerate(d["rx"])}}
         for d in status_data["sensor_data"]
