@@ -17,7 +17,7 @@ status_data = {
     "finished": False,
     "result": "",
     "params": {},
-    "sensor_data": []
+    "sensor_data": [] # This will now store entries from the combined data
 }
 
 @app.route('/')
@@ -34,19 +34,49 @@ def serve_static(filename):
 @app.route('/api/post', methods=['POST'])
 def receive_sensor_data():
     data = request.get_json()
-    if not data or 'rx' not in data or 'tx' not in data or 'time' not in data: # Added 'time' check
-        return jsonify({"error": "Invalid data, missing time, rx, or tx"}), 400
-    
-    # Ensure rx is a list of numbers
-    if not isinstance(data["rx"], list) or not all(isinstance(val, (int, float)) for val in data["rx"]):
-        return jsonify({"error": "Invalid 'rx' format, expected list of numbers"}), 400
 
-    status_data["sensor_data"].append({
-        "time": data["time"],
-        "tx": data["tx"],
-        "rx": data["rx"]
-    })
-    return jsonify({"message": "Data received"}), 200
+    # --- MODIFICATION STARTS HERE ---
+    # Expected combined JSON format from Arduino:
+    # {"time": T, "samples": [{"tx":N, "rx":[...]}, {"tx":M, "rx":[...]}, ...]}
+
+    if not data or 'time' not in data or 'samples' not in data:
+        # Log for debugging purposes, will appear in your Flask console
+        print(f"ERROR: Invalid top-level data format. Received: {data}")
+        return jsonify({"error": "Invalid data, missing 'time' or 'samples' array"}), 400
+
+    overall_timestamp = data["time"]
+    samples_data = data["samples"]
+
+    if not isinstance(samples_data, list):
+        print(f"ERROR: 'samples' is not a list. Received: {samples_data}")
+        return jsonify({"error": "Invalid 'samples' format, expected a list"}), 400
+
+    # Iterate through each individual sample within the 'samples' array
+    for sample_entry in samples_data:
+        # Validate each individual sample dictionary
+        if not isinstance(sample_entry, dict) or 'tx' not in sample_entry or 'rx' not in sample_entry:
+            print(f"ERROR: Invalid sample entry within 'samples' array. Received: {sample_entry}")
+            return jsonify({"error": "Invalid sample entry within 'samples' array, missing 'tx' or 'rx'"}), 400
+
+        tx_value = sample_entry["tx"]
+        rx_list = sample_entry["rx"]
+
+        # Ensure 'rx' is a list of numbers for each sub-entry
+        if not isinstance(rx_list, list) or not all(isinstance(val, (int, float)) for val in rx_list):
+            print(f"ERROR: Invalid 'rx' format for TX {tx_value}. Expected list of numbers. Received: {rx_list}")
+            return jsonify({"error": f"Invalid 'rx' format for TX {tx_value}, expected list of numbers"}), 400
+
+        # Store the individual TX/RX readings.
+        # Use the `overall_timestamp` from the outer JSON to group these
+        # individual TX-RX readings as part of the same scan.
+        status_data["sensor_data"].append({
+            "time": overall_timestamp, # Use the timestamp from the outer combined JSON
+            "tx": tx_value,
+            "rx": rx_list
+        })
+    # --- MODIFICATION ENDS HERE ---
+
+    return jsonify({"message": "Combined data received and processed"}), 200
 
 @app.route('/api/start', methods=['POST'])
 def start_test():
@@ -120,11 +150,17 @@ def get_status():
                 # Determine result based on classification type and average RX
                 if ctype == "fresh_rotten":
                     if avg > status_data["params"]["fresh_threshold"]:
+                    # Adjust thresholds based on your sensor data characteristics
+                    # Example: Lower values for fresh, higher for rotten.
+                    # This logic assumes higher values means more 'rotten' based on your previous discussions.
                         result = "Rotten"
                     else:
                         result = "Fresh"
                 elif ctype == "soft_hard":
                     if avg > status_data["params"]["soft_threshold"]:
+                    # Adjust thresholds based on your sensor data characteristics
+                    # Example: Lower values for soft, higher for hard.
+                    # This logic assumes higher values means more 'hard' based on your previous discussions.
                         result = "Hard"
                     else:
                         result = "Soft"
@@ -153,41 +189,59 @@ def plot_img():
     # Prepare data for plotting: each RX channel as a separate column over time
     all_rx_readings_for_df = []
     for entry in status_data["sensor_data"]:
-        row_dict = {"time": entry["time"]}
+        # Each 'entry' here is like: {"time": T, "tx": N, "rx": [R0, R1, ...]}
+        # We want to plot RX values against time.
+        # To distinguish between RX values from different TXs at the same 'time' (from combined packet),
+        # we'll create columns like TX0_RX0, TX0_RX1, etc.
+        # Or, simpler, just plot RX0, RX1, etc., and let the 'tx' column differentiate.
+
+        # To match the CSV structure (time, tx, rx0, rx1...rx6), we'll do the same for plotting:
+        row_dict = {"time": entry["time"], "tx": entry["tx"]} # Include TX in the row
         for i, rx_val in enumerate(entry["rx"]):
-            row_dict[f"RX{i}"] = rx_val
+            row_dict[f"rx{i}"] = rx_val # Use rx0, rx1... column names
         all_rx_readings_for_df.append(row_dict)
 
     df_plot = pd.DataFrame(all_rx_readings_for_df)
 
     plt.figure(figsize=(12, 7)) # Adjust figure size for better readability
 
-    # Determine x-axis: use 'time' if available, otherwise use DataFrame index
-    # It's crucial that 'time' values from Arduino are unique and incrementally increasing
     x_axis_label = "Time (from Arduino)"
+    # Use 'time' for the x-axis, if it exists and is numeric
     if 'time' in df_plot.columns and pd.api.types.is_numeric_dtype(df_plot['time']):
         x_axis_data = df_plot['time']
     else:
         x_axis_data = df_plot.index
-        x_axis_label = "Sample Index" # Fallback if 'time' is not numeric or not present
+        x_axis_label = "Sample Index" # Fallback
 
-    # Plot each RX column
-    # Assuming RX0 to RX6, modify range if number of RX channels changes
+    # Plot each RX column, but now we have multiple TXs.
+    # We should plot each TX-RX combination uniquely.
+    # This loop assumes a flat structure where each row is a (time, tx, [rx]) snapshot.
+    # If you want to see all RX for a given TX (e.g., RX0 across all TXs), this logic is fine.
+    # If you want to differentiate RX0 from TX0, TX1, etc., then you'd need more specific columns.
+
+    # Given your CSV has `tx` as a column and then `rx0` to `rx6`,
+    # the plot will show lines for rx0, rx1, etc., across all `tx` values.
+    # This can make the plot busy. A better plot might be to group by `tx` first.
+
+    # Let's plot each RX value, and color/style by TX, or simply plot separate charts.
+    # For now, sticking to your current plotting approach, which plots all rx columns:
     for i in range(7): 
-        col_name = f"RX{i}"
-        if col_name in df_plot.columns: # Check if the column exists
+        col_name = f"rx{i}" # This plots a line for 'rx0', 'rx1' etc.
+        if col_name in df_plot.columns:
+            # You might want to filter by TX if the plot gets too messy
+            # e.g., plt.plot(df_plot[df_plot['tx'] == 0]['time'], df_plot[df_plot['tx'] == 0][col_name], label=f"TX0_{col_name}")
             plt.plot(x_axis_data, df_plot[col_name], label=col_name, marker='.', markersize=4, linestyle='-')
 
     plt.xlabel(x_axis_label)
     plt.ylabel("Sensor Value")
-    plt.title("Individual Sensor Data Over Time (All RX Channels)")
-    plt.legend(loc='best') # Place legend in the best possible position
-    plt.grid(True) # Add grid for better readability
-    plt.tight_layout() # Adjust layout to prevent labels from overlapping
+    plt.title("Individual Sensor Data Over Time (All RX Channels, all TX cycles)")
+    plt.legend(loc='best')
+    plt.grid(True)
+    plt.tight_layout()
 
     buf = io.BytesIO()
     plt.savefig(buf, format="png")
-    plt.close() # Close the plot to free up memory
+    plt.close()
     buf.seek(0)
     return send_file(buf, mimetype="image/png")
 
@@ -198,6 +252,8 @@ def download_csv():
     
     # This structure correctly flattens the RX list into multiple columns (rx0, rx1, ...)
     # Each dictionary in the list becomes a row in the DataFrame
+    # This part correctly processes the data stored in sensor_data (which now holds
+    # entries from the combined Arduino payload)
     df = pd.DataFrame([
         {"time": d["time"], "tx": d["tx"], **{f"rx{i}": val for i, val in enumerate(d["rx"])}}
         for d in status_data["sensor_data"]
