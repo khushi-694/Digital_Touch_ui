@@ -1,11 +1,11 @@
 #include <WiFiNINA.h>
 #include <ArduinoHttpClient.h>
 
-const char* ssid = "OnePlus Nord CE4";
-const char* pass = "jumbo8686";
+const char* ssid = "Khushi's F15";
+const char* pass = "SAKSHAM1!";
 
 
-char serverAddress[] = "ui-e3hy.onrender.com";
+char serverAddress[] = "digital-touch-ui.onrender.com";
 int port = 443;
 
 WiFiSSLClient wifi;  
@@ -63,8 +63,14 @@ void setup() {
 
 void loop() {
   static unsigned long lastSample = 0;
-  if (millis() - lastSample >= 500) {
+  const unsigned long SEND_INTERVAL_MS = 200; // Target 0.2 second interval
+
+  if (millis() - lastSample >= SEND_INTERVAL_MS) {
     lastSample = millis();
+
+    // Data structure to hold all TX-RX sets for this sample
+    // Example: {"time": T, "samples": [{"tx":0, "rx":[...]}, {"tx":1, "rx":[...]}, ...]}
+    String overallJson = "{\"time\":" + String(millis()) + ",\"samples\":[";
 
     for (int tx = 0; tx < TX_NUM; tx++) {
       digitalWrite(txPins[tx], HIGH);
@@ -79,32 +85,38 @@ void loop() {
       }
       digitalWrite(txPins[tx], LOW);
 
-      String json = "{\"time\":" + String(millis()) + ",\"tx\":" + String(tx) + ",\"rx\":[";
+      // Build JSON for this specific TX-RX set
+      overallJson += "{\"tx\":" + String(tx) + ",\"rx\":[";
       for (int i = 0; i < RX_NUM; i++) {
-        json += String(rx_values[i]);
-        if (i < RX_NUM - 1) json += ",";
+        overallJson += String(rx_values[i]);
+        if (i < RX_NUM - 1) overallJson += ",";
       }
-      json += "]}";
+      overallJson += "]}";
 
-      Serial.print("Sending data: ");
-      Serial.println(json);
-
-      client.beginRequest();
-      client.post("/api/post"); // Make sure your Flask route is /api/post
-      client.sendHeader("Content-Type", "application/json");
-      client.sendHeader("Content-Length", json.length());
-      client.beginBody();
-      client.print(json);
-      client.endRequest();
-
-      int statusCode = client.responseStatusCode();
-      String response = client.responseBody();
-      Serial.print("TX: ");
-      Serial.print(tx);
-      Serial.print(" Status: ");
-      Serial.print(statusCode);
-      Serial.print(" Response: ");
-      Serial.println(response);
+      if (tx < TX_NUM - 1) {
+        overallJson += ","; // Add comma if not the last TX
+      }
     }
+    overallJson += "]}"; // Close the 'samples' array and the main JSON object
+
+    Serial.print("Sending combined data: ");
+    Serial.println(overallJson);
+
+    // Send combined HTTP POST request
+    client.beginRequest();
+    client.post("/api/post");
+    client.sendHeader("Content-Type", "application/json");
+    client.sendHeader("Content-Length", overallJson.length());
+    client.beginBody();
+    client.print(overallJson);
+    client.endRequest();
+
+    // Read and print server response for the combined request
+    int statusCode = client.responseStatusCode();
+    String response = client.responseBody();
+    Serial.print("Combined Request Status: ");
+    Serial.print(statusCode);
+    Serial.print(" Response: ");
+    Serial.println(response);
   }
 }
